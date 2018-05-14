@@ -1,13 +1,13 @@
 from math import exp
-from mxnet import gluon
-from mxnet import autograd
-from mxnet import nd
-from mxnet import image
-from mxnet.gluon import nn
-import mxnet as mx
-import numpy as np
+import random
 from time import time
+
+import matplotlib as mpl
 import matplotlib.pyplot as plt
+import mxnet as mx
+from mxnet import autograd, gluon, image, nd
+from mxnet.gluon import nn, data as gdata, loss as gloss, utils as gutils
+import numpy as np
 
 class DataLoader(object):
     """similiar to gluon.data.DataLoader, but might be faster.
@@ -64,51 +64,6 @@ def load_data_fashion_mnist(batch_size, resize=None, root="~/.mxnet/datasets/fas
     test_data = DataLoader(mnist_test, batch_size, shuffle=False, transform=transform_mnist)
     return (train_data, test_data)
 
-def SGD(params, lr):
-    for param in params:
-        param[:] = param - lr * param.grad
-
-def accuracy(output, label):
-    return nd.mean(output.argmax(axis=1)==label).asscalar()
-
-def evaluate_accuracy(data_iterator, net, ctx=[mx.cpu()]):
-    if isinstance(ctx, mx.Context):
-        ctx = [ctx]
-    acc = nd.array([0])
-    n = 0.
-    if isinstance(data_iterator, mx.io.MXDataIter):
-        data_iterator.reset()
-    for batch in data_iterator:
-        data, label, batch_size = _get_batch(batch, ctx)
-        for X, y in zip(data, label):
-            acc += nd.sum(net(X).argmax(axis=1)==y).copyto(mx.cpu())
-            n += y.size
-        acc.wait_to_read() # don't push too many operators into backend
-    return acc.asscalar() / n
-
-def show_images(imgs, nrows, ncols, figsize=None):
-    """plot a list of images"""
-    if not figsize:
-        figsize = (ncols, nrows)
-    _, figs = plt.subplots(nrows, ncols, figsize=figsize)
-    for i in range(nrows):
-        for j in range(ncols):
-            figs[i][j].imshow(imgs[i*ncols+j].asnumpy())
-            figs[i][j].axes.get_xaxis().set_visible(False)
-            figs[i][j].axes.get_yaxis().set_visible(False)
-    plt.show()
-
-def _get_batch(batch, ctx):
-    """return data and label on ctx"""
-    if isinstance(batch, mx.io.DataBatch):
-        data = batch.data[0]
-        label = batch.label[0]
-    else:
-        data, label = batch
-    return (gluon.utils.split_and_load(data, ctx),
-            gluon.utils.split_and_load(label, ctx),
-            data.shape[0])
-
 def try_gpu():
     """If GPU is available, return mx.gpu(0); else return mx.cpu()"""
     try:
@@ -117,6 +72,66 @@ def try_gpu():
     except:
         ctx = mx.cpu()
     return ctx
+
+def try_all_gpus():
+    """Return all available GPUs, or [mx.gpu()] if there is no GPU"""
+    ctx_list = []
+    try:
+        for i in range(16):
+            ctx = mx.gpu(i)
+            _ = nd.array([0], ctx=ctx)
+            ctx_list.append(ctx)
+    except:
+        pass
+    if not ctx_list:
+        ctx_list = [mx.cpu()]
+    return ctx_list
+
+def SGD(params, lr):
+    """（不要用，最后删掉）"""
+    for param in params:
+        param[:] = param - lr * param.grad
+
+
+def sgd(params, lr, batch_size):
+    """小批量随机梯度下降。"""
+    for param in params:
+        param[:] = param - lr * param.grad / batch_size
+
+
+def accuracy(output, label):
+    """准确率。"""
+    return (output.argmax(axis=1) == label).mean().asscalar()
+
+
+def _get_batch(batch, ctx):
+    if isinstance(batch, mx.io.DataBatch):
+        features = batch.data[0]
+        labels = batch.label[0]
+    else:
+        features, labels = batch
+    return (gutils.split_and_load(features, ctx),
+            gutils.split_and_load(labels, ctx),
+            features.shape[0])
+
+
+def evaluate_accuracy(data_iter, net, ctx=[mx.cpu()]):
+    """评价模型在数据集上的准确率。"""
+    if isinstance(ctx, mx.Context):
+        ctx = [ctx]
+    acc = nd.array([0])
+    n = 0
+    if isinstance(data_iter, mx.io.MXDataIter):
+        data_iter.reset()
+    for batch in data_iter:
+        features, labels, batch_size = _get_batch(batch, ctx)
+        for X, y in zip(features, labels):
+            y = y.astype('float32')
+            acc += (net(X).argmax(axis=1)==y).sum().copyto(mx.cpu())
+            n += y.size
+        acc.wait_to_read() 
+    return acc.asscalar() / n
+
 
 def train(train_data, test_data, net, loss, trainer, ctx, num_epochs, print_batches=None):
     """Train a network"""
@@ -151,3 +166,250 @@ def train(train_data, test_data, net, loss, trainer, ctx, num_epochs, print_batc
         print("Epoch %d. Loss: %.3f, Train acc %.2f, Test acc %.2f, Time %.1f sec" % (
             epoch, train_loss/n, train_acc/m, test_acc, time() - start
         ))
+
+class Residual(nn.HybridBlock):
+    def __init__(self, channels, same_shape=True, **kwargs):
+        super(Residual, self).__init__(**kwargs)
+        self.same_shape = same_shape
+        with self.name_scope():
+            strides = 1 if same_shape else 2
+            self.conv1 = nn.Conv2D(channels, kernel_size=3, padding=1,
+                                  strides=strides)
+            self.bn1 = nn.BatchNorm()
+            self.conv2 = nn.Conv2D(channels, kernel_size=3, padding=1)
+            self.bn2 = nn.BatchNorm()
+            if not same_shape:
+                self.conv3 = nn.Conv2D(channels, kernel_size=1,
+                                      strides=strides)
+
+    def hybrid_forward(self, F, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        if not self.same_shape:
+            x = self.conv3(x)
+        return F.relu(out + x)
+
+def resnet18(num_classes):
+    net = nn.HybridSequential()
+    with net.name_scope():
+        net.add(
+            nn.BatchNorm(),
+            nn.Conv2D(64, kernel_size=3, strides=1),
+            nn.MaxPool2D(pool_size=3, strides=2),
+            Residual(64),
+            Residual(64),
+            Residual(128, same_shape=False),
+            Residual(128),
+            Residual(256, same_shape=False),
+            Residual(256),
+            nn.GlobalAvgPool2D(),
+            nn.Dense(num_classes)
+        )
+    return net
+
+def show_images(imgs, nrows, ncols, figsize=None):
+    """plot a list of images"""
+    if not figsize:
+        figsize = (ncols, nrows)
+    _, figs = plt.subplots(nrows, ncols, figsize=figsize)
+    for i in range(nrows):
+        for j in range(ncols):
+            figs[i][j].imshow(imgs[i*ncols+j].asnumpy())
+            figs[i][j].axes.get_xaxis().set_visible(False)
+            figs[i][j].axes.get_yaxis().set_visible(False)
+    plt.show()
+
+def data_iter_random(corpus_indices, batch_size, num_steps, ctx=None):
+    """Sample mini-batches in a random order from sequential data."""
+    # Subtract 1 because label indices are corresponding input indices + 1. 
+    num_examples = (len(corpus_indices) - 1) // num_steps
+    epoch_size = num_examples // batch_size
+    # Randomize samples.
+    example_indices = list(range(num_examples))
+    random.shuffle(example_indices)
+
+    def _data(pos):
+        return corpus_indices[pos: pos + num_steps]
+
+    for i in range(epoch_size):
+        # Read batch_size random samples each time.
+        i = i * batch_size
+        batch_indices = example_indices[i: i + batch_size]
+        data = nd.array(
+            [_data(j * num_steps) for j in batch_indices], ctx=ctx)
+        label = nd.array(
+            [_data(j * num_steps + 1) for j in batch_indices], ctx=ctx)
+        yield data, label
+
+def data_iter_consecutive(corpus_indices, batch_size, num_steps, ctx=None):
+    """Sample mini-batches in a consecutive order from sequential data."""
+    corpus_indices = nd.array(corpus_indices, ctx=ctx)
+    data_len = len(corpus_indices)
+    batch_len = data_len // batch_size
+    
+    indices = corpus_indices[0: batch_size * batch_len].reshape((
+        batch_size, batch_len))
+    # Subtract 1 because label indices are corresponding input indices + 1. 
+    epoch_size = (batch_len - 1) // num_steps
+    
+    for i in range(epoch_size):
+        i = i * num_steps
+        data = indices[:, i: i + num_steps]
+        label = indices[:, i + 1: i + num_steps + 1]
+        yield data, label
+
+
+def grad_clipping(params, clipping_norm, ctx):
+    """Gradient clipping."""
+    if clipping_norm is not None:
+        norm = nd.array([0.0], ctx)
+        for p in params:
+            norm += nd.sum(p.grad ** 2)
+        norm = nd.sqrt(norm).asscalar()
+        if norm > clipping_norm:
+            for p in params:
+                p.grad[:] *= clipping_norm / norm
+
+
+def predict_rnn(rnn, prefix, num_chars, params, hidden_dim, ctx, idx_to_char,
+                char_to_idx, get_inputs, is_lstm=False):
+    """Predict the next chars given the prefix."""
+    prefix = prefix.lower()
+    state_h = nd.zeros(shape=(1, hidden_dim), ctx=ctx)
+    if is_lstm:
+        state_c = nd.zeros(shape=(1, hidden_dim), ctx=ctx)
+    output = [char_to_idx[prefix[0]]]
+    for i in range(num_chars + len(prefix)):
+        X = nd.array([output[-1]], ctx=ctx)
+        if is_lstm:
+            Y, state_h, state_c = rnn(get_inputs(X), state_h, state_c, *params)
+        else:
+            Y, state_h = rnn(get_inputs(X), state_h, *params)
+        if i < len(prefix)-1:
+            next_input = char_to_idx[prefix[i+1]]
+        else:
+            next_input = int(Y[0].argmax(axis=1).asscalar())
+        output.append(next_input)
+    return ''.join([idx_to_char[i] for i in output])
+
+
+def train_and_predict_rnn(rnn, is_random_iter, epochs, num_steps, hidden_dim, 
+                          learning_rate, clipping_norm, batch_size,
+                          pred_period, pred_len, seqs, get_params, get_inputs,
+                          ctx, corpus_indices, idx_to_char, char_to_idx,
+                          is_lstm=False):
+    """Train an RNN model and predict the next item in the sequence."""
+    if is_random_iter:
+        data_iter = data_iter_random
+    else:
+        data_iter = data_iter_consecutive
+    params = get_params()
+    
+    softmax_cross_entropy = gluon.loss.SoftmaxCrossEntropyLoss()
+
+    for e in range(1, epochs + 1): 
+        # If consecutive sampling is used, in the same epoch, the hidden state
+        # is initialized only at the beginning of the epoch.
+        if not is_random_iter:
+            state_h = nd.zeros(shape=(batch_size, hidden_dim), ctx=ctx)
+            if is_lstm:
+                state_c = nd.zeros(shape=(batch_size, hidden_dim), ctx=ctx)
+        train_loss, num_examples = 0, 0
+        for data, label in data_iter(corpus_indices, batch_size, num_steps, 
+                                     ctx):
+            # If random sampling is used, the hidden state has to be
+            # initialized for each mini-batch.
+            if is_random_iter:
+                state_h = nd.zeros(shape=(batch_size, hidden_dim), ctx=ctx)
+                if is_lstm:
+                    state_c = nd.zeros(shape=(batch_size, hidden_dim), ctx=ctx)
+            with autograd.record():
+                # outputs shape: (batch_size, vocab_size)
+                if is_lstm:
+                    outputs, state_h, state_c = rnn(get_inputs(data), state_h,
+                                                    state_c, *params) 
+                else:
+                    outputs, state_h = rnn(get_inputs(data), state_h, *params)
+                # Let t_ib_j be the j-th element of the mini-batch at time i.
+                # label shape: (batch_size * num_steps)
+                # label = [t_0b_0, t_0b_1, ..., t_1b_0, t_1b_1, ..., ].
+                label = label.T.reshape((-1,))
+                # Concatenate outputs:
+                # shape: (batch_size * num_steps, vocab_size).
+                outputs = nd.concat(*outputs, dim=0)
+                # Now outputs and label are aligned.
+                loss = softmax_cross_entropy(outputs, label)
+            loss.backward()
+
+            grad_clipping(params, clipping_norm, ctx)
+            SGD(params, learning_rate)
+
+            train_loss += nd.sum(loss).asscalar()
+            num_examples += loss.size
+
+        if e % pred_period == 0:
+            print("Epoch %d. Training perplexity %f" % (e, 
+                                               exp(train_loss/num_examples)))
+            for seq in seqs:
+                print(' - ', predict_rnn(rnn, seq, pred_len, params,
+                      hidden_dim, ctx, idx_to_char, char_to_idx, get_inputs,
+                      is_lstm))
+            print()
+
+def set_fig_size(mpl, figsize=(3.5, 2.5)):
+    """为matplotlib生成的图片设置大小。"""
+    mpl.rcParams['figure.figsize'] = figsize
+
+
+def data_iter(batch_size, num_examples, features, labels): 
+    """遍历数据集。"""
+    indices = list(range(num_examples))
+    random.shuffle(indices)
+    for i in range(0, num_examples, batch_size):
+        j = nd.array(indices[i: min(i + batch_size, num_examples)])
+        yield features.take(j), labels.take(j)
+
+
+def linreg(X, w, b):
+    """线性回归模型。"""
+    return nd.dot(X, w) + b
+
+
+def squared_loss(y_hat, y):
+    """平方损失函数。"""
+    return (y_hat - y.reshape(y_hat.shape)) ** 2 / 2
+
+
+def optimize(batch_size, trainer, num_epochs, decay_epoch, log_interval,
+             features, labels, net):
+    """优化目标函数。"""
+    dataset = gdata.ArrayDataset(features, labels)
+    data_iter = gdata.DataLoader(dataset, batch_size, shuffle=True)
+    loss = gloss.L2Loss()
+    ls = [loss(net(features), labels).mean().asnumpy()]
+    for epoch in range(1, num_epochs + 1): 
+        # 学习率自我衰减。
+        if decay_epoch and epoch > decay_epoch:
+            trainer.set_learning_rate(trainer.learning_rate * 0.1)
+        for batch_i, (X, y) in enumerate(data_iter):
+            with autograd.record():
+                l = loss(net(X), y)
+            l.backward()
+            trainer.step(batch_size)
+            if batch_i * batch_size % log_interval == 0:
+                ls.append(loss(net(features), labels).mean().asnumpy())
+    # 为了便于打印，改变输出形状并转化成numpy数组。
+    print('w:', net[0].weight.data(), '\nb:', net[0].bias.data(), '\n')
+    es = np.linspace(0, num_epochs, len(ls), endpoint=True)
+    semilogy(es, ls, 'epoch', 'loss')
+
+
+def semilogy(x_vals, y_vals, x_label, y_label, figsize=(3.5, 2.5)):
+    """绘图（y取对数）。"""		
+    set_fig_size(mpl, figsize)
+    plt.semilogy(x_vals, y_vals)
+    plt.xlabel(x_label)
+    plt.ylabel(y_label)
+    plt.show()
+
+
